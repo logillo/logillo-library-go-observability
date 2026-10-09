@@ -1,0 +1,7 @@
+# Build and editor leftovers
+/bin/
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
