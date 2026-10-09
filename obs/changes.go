@@ -29,10 +29,9 @@ func newChangeTracker(max int) *changeTracker {
 	return &changeTracker{max: max, order: list.New(), byKey: make(map[string]*list.Element)}
 }
 
-// unchanged records the answer for key and reports whether it matches the
-// answer recorded before.
-func (t *changeTracker) unchanged(key string, body []byte) bool {
-	hash := sha256.Sum256(body)
+// unchanged records the digest of the answer for key and reports whether
+// it matches the one recorded before.
+func (t *changeTracker) unchanged(key string, hash [sha256.Size]byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if el, ok := t.byKey[key]; ok {

@@ -140,11 +140,18 @@ func ClientIP(r *http.Request) string {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	wrote  bool
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
+	r.wrote = true
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	r.wrote = true
+	return r.ResponseWriter.Write(p)
 }
 
 func (r *statusRecorder) Flush() {
@@ -166,28 +173,35 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 // http.ErrAbortHandler re-panics untouched: it is net/http's sanctioned way
 // to abort a response and must reach the server's own recover.
 //
-// A service with its own error envelope wraps the same way with its own
-// writer; this one speaks the integration contract's envelope.
+// A panic after the handler has started its response gets no envelope: the
+// status is on the wire already, and a body appended to a partial one
+// would read as the handler's. A service with its own error envelope wraps
+// the same way with its own writer; this one speaks the integration
+// contract's envelope.
 func RecoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
-			rec := recover()
-			if rec == nil {
+			p := recover()
+			if p == nil {
 				return
 			}
-			if rec == http.ErrAbortHandler { //nolint:errorlint // sentinel comparison per net/http docs
-				panic(rec)
+			if p == http.ErrAbortHandler { //nolint:errorlint // sentinel comparison per net/http docs
+				panic(p)
 			}
 			slog.ErrorContext(r.Context(), "panic recovered",
-				"panic", rec,
+				"panic", p,
 				"method", r.Method,
 				"path", r.URL.Path,
 				"stack_trace", string(debug.Stack()),
 			)
+			if rec.wrote {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"status":500,"error":"upstream_error","message":"Integration service encountered an internal error."}`))
+			_, _ = w.Write([]byte(`{"status":500,"error":"upstream_error","message":"The service encountered an internal error."}`))
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(rec, r)
 	})
 }

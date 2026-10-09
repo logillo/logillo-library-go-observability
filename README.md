@@ -22,17 +22,24 @@ exporting to Cloud Trace on GCP. `HTTPHandler` opens the server span;
 `NewHTTPClient` carries the trace onward, so one request is one waterfall from
 the portal through service-api and an adapter to the carrier.
 
-**One request id.** `RequestIDMiddleware` accepts or mints `X-Request-ID` and
-echoes it; service-api forwards it to every adapter; every log line in every
-service carries it.
+**One request id.** `RequestIDMiddleware` keeps the `X-Request-ID` a caller
+sends when it is a UUID, mints a UUIDv7 otherwise, and echoes it; a capturer
+built with `ForwardRequestID()` sends it on to another Logillo service; every
+log line in every service carries it.
 
 **Capture.** A `Capturer` records HTTP exchanges in full — request and
 response, headers and bodies — as `exchange` log records:
 
 ```go
-capturer := obs.NewCapturer("carrier-a", obs.ArchiveTo(archive))
+capturer := obs.NewCapturer("carrier-a",
+    obs.ArchiveTo(archive),
+    // what no generic rule can know: this peer's account number travels as a party's id
+    obs.SensitiveFields(func(parent, name string) bool { return parent == "parties" && name == "id" }),
+    // what changes on every answer without meaning a change
+    obs.VolatileFields("transactionId"),
+)
 
-// outbound: every call this client makes is captured
+// outbound: every call this client makes is captured (a zero timeout is none)
 client := capturer.Client(30 * time.Second)
 
 // per call: name it, archive it, or capture it only when the answer changes
@@ -40,7 +47,8 @@ ctx = obs.WithOperation(ctx, "booking.create")
 ctx = obs.WithArchiving(ctx)
 ctx = obs.WithChangeKey(ctx, "tracking:"+trackingNumber)
 
-// inbound: the service decides what to keep once the response is written
+// inbound: mounted on the router, inside the access log, so the matched route
+// is known; the service decides what to keep once the response is written
 router.Use(capturer.Inbound(func(r *http.Request, status int) obs.InboundDecision {
     apiKey := obs.ActorAPIKeyID(r.Context()) != ""
     write := r.Method != http.MethodGet
@@ -50,28 +58,41 @@ router.Use(capturer.Inbound(func(r *http.Request, status int) obs.InboundDecisio
 
 Every capture obeys the same rules, tested here once for all services:
 
-- **Secrets are blanked** by name — headers, query parameters, JSON fields,
-  form fields, XML elements, all by the one list. Any name containing
-  `password`, `secret`, `token`, `credential`, `apikey`, `authorization`,
-  `signature`, `cookie`, `accountnumber`, `client_id`, `idempotency`, the
-  exact names `pass`, `pwd`, `session`, `eid`, or whose last word is `key`
-  (`customerKey`, `X-Api-Key`), except identifiers such as `primaryKey`.
+- **Secrets are blanked** by name — headers, query parameters, URLs carried
+  as values or in `Location`, JSON fields, form fields, XML elements and
+  CDATA, documents encoded inside strings, `name: value` lines in text — all
+  by one test (`redact.go`): a name containing `password`, `secret`, `token`,
+  `credential`, `apikey`, `authorization`, `hmac`, `cookie`, an account
+  number under any spelling, `client_id`, `idempotency`; a request
+  `signature`; the exact names `pass`, `pwd`, `pin`, `otp`, `session`,
+  `eid`, `sig`, `auth`, `account`, `apiid`; a name ending in `key`
+  (`customerKey`, `X-Api-Key`). Identifiers stay: a bare `key`, `clientId`,
+  `signatureRequired`, `nextPageToken`. A peer's own shape is added with
+  `SensitiveFields`.
 - **Files become a size and a SHA-256** — labels, PDFs, images, any base64
-  content — so what was exchanged can still be proven without the bytes.
-- **Large bodies are cut** at 100 KiB and marked `truncated`.
+  content, a PDF handed over as text — so what was exchanged can still be
+  proven without the bytes.
+- **Bodies are held up to 2 MiB** for the record; the log line carries them
+  cut at 64 KiB and marked `truncated`, the archive whole. An inbound body
+  is read as the handler reads it, never ahead of it.
 - **Repeated answers are captured once per change** when the call carries a
   change key: a tracking poll writes its bodies when the status moves and a
-  bodiless DEBUG line otherwise.
+  bodiless DEBUG line otherwise — a failure stays a WARNING either way. Fields
+  named with `VolatileFields` are left out of the comparison.
+- **Traces carry no secrets either**: the URL attributes of exported spans
+  are blanked the same way, and `ErrorText` gives an error's text with its
+  URL's secrets blanked.
 - Every record carries `capture: "exchange"` — the field the log router uses
   to file these records in their own bucket, with their own retention and
   readers.
 
-**Archive.** Exchanges marked with `WithArchiving` are also stored as files
-in a Cloud Storage bucket (`EXCHANGE_ARCHIVE_BUCKET`, see
-`NewArchiveFromEnv`), one JSON file per exchange under
-`<peer>/<day>/<request id>/<time>-<operation>-<hash>.json`, holding exactly
-what the log holds. Logs answer questions for weeks; the archive answers them for as
-long as a dispute can arise.
+**Archive.** Exchanges marked with `WithArchiving` or approved by
+`ArchiveWhen` are also stored as files in a Cloud Storage bucket
+(`EXCHANGE_ARCHIVE_BUCKET`, see `NewArchiveFromEnv`), one JSON file per
+exchange under `<peer>/<day>/<request id>/<time>-<operation>-<hash>.json`,
+with the bodies whole. The write runs on a context of its own, so a client
+that stopped waiting costs no record. Logs answer questions for weeks; the
+archive answers them for as long as a dispute can arise.
 
 ## What it does not do
 

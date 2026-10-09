@@ -3,12 +3,15 @@ package obs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +37,8 @@ type Capturer struct {
 	peer             string
 	archive          Archive
 	bodyLimit        int
+	rules            *rules
+	volatile         map[string]bool
 	changes          *changeTracker
 	peerOf           func(*http.Request) string
 	opOf             func(*http.Request) string
@@ -46,21 +51,50 @@ type Capturer struct {
 // CapturerOption configures a Capturer.
 type CapturerOption func(*Capturer)
 
-// ArchiveTo stores the exchanges marked with WithArchiving in a.
+// ArchiveTo stores the exchanges marked with WithArchiving in a. A nil
+// archive, typed or not, keeps NopArchive.
 func ArchiveTo(a Archive) CapturerOption {
 	return func(c *Capturer) {
-		if a != nil {
-			c.archive = a
+		if a == nil {
+			return
 		}
+		if v := reflect.ValueOf(a); v.Kind() == reflect.Pointer && v.IsNil() {
+			return
+		}
+		c.archive = a
 	}
 }
 
-// BodyLimit caps one captured body at n bytes; larger bodies are cut and
-// marked. The default is 100 KiB.
+// BodyLimit caps one captured body on the log line at n bytes; a larger
+// body is cut there and marked, while the archive keeps it whole up to
+// 2 MiB. The default is 64 KiB.
 func BodyLimit(n int) CapturerOption {
 	return func(c *Capturer) {
 		if n > 0 {
 			c.bodyLimit = n
+		}
+	}
+}
+
+// SensitiveFields adds a rule for a peer whose secrets travel under names
+// no generic rule can know: f reports whether the field name under parent
+// is a secret, and its value is written as "<redacted>". An account number
+// carried as the `id` of a party is the shape this exists for.
+func SensitiveFields(f func(parent, name string) bool) CapturerOption {
+	return func(c *Capturer) {
+		if f != nil {
+			c.rules = &rules{sensitive: f}
+		}
+	}
+}
+
+// VolatileFields names the JSON fields a repeated answer carries that
+// change on every call without meaning a change — a per-call transaction
+// id, a timestamp — so a change-keyed poll is compared without them.
+func VolatileFields(names ...string) CapturerOption {
+	return func(c *Capturer) {
+		for _, n := range names {
+			c.volatile[strings.ToLower(n)] = true
 		}
 	}
 }
@@ -110,6 +144,8 @@ func NewCapturer(peer string, opts ...CapturerOption) *Capturer {
 		peer:      peer,
 		archive:   NopArchive{},
 		bodyLimit: defaultBodyLimit,
+		rules:     defaultRules,
+		volatile:  map[string]bool{},
 		changes:   newChangeTracker(20000),
 		now:       time.Now,
 	}
@@ -207,6 +243,16 @@ type exchangeSide struct {
 	bodyRecord
 }
 
+// cut returns the side with its body cut at limit for a log line.
+func (s *exchangeSide) cut(limit int) *exchangeSide {
+	if s == nil {
+		return nil
+	}
+	c := *s
+	c.bodyRecord = s.bodyRecord.cut(limit)
+	return &c
+}
+
 // exchangeRecord is what is logged and archived for one exchange. The log
 // line carries these as flat attributes beside the request id and the
 // business keys bound on the context; the archive file carries them all
@@ -260,8 +306,16 @@ func (c *Capturer) resolveOperation(ctx context.Context, r *http.Request) string
 	return ""
 }
 
+// archiveTimeout bounds the archive write of one exchange. The write runs
+// on a context of its own: the request's may already be cancelled — a
+// client that stopped waiting for its booking — and that exchange is the
+// one a dispute turns on.
+const archiveTimeout = 10 * time.Second
+
 // emit writes the record as a log line and, when asked, as an archive file.
-// The archive is written first so the log line can point at the file.
+// The archive is written first so the log line can point at the file, and
+// holds the record whole; the log line holds the bodies cut at the body
+// limit.
 func (c *Capturer) emit(ctx context.Context, rec *exchangeRecord, archive bool) {
 	rec.Capture = "exchange"
 	rec.RequestID = RequestID(ctx)
@@ -286,7 +340,9 @@ func (c *Capturer) emit(ctx context.Context, rec *exchangeRecord, archive bool) 
 		if encoded, err := json.Marshal(rec); err != nil {
 			archiveErr = err
 		} else {
-			location, err := c.archive.Store(ctx, archiveObjectName(rec.Peer, rec.Operation, rec.RequestID, rec.At, encoded), encoded)
+			storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), archiveTimeout)
+			location, err := c.archive.Store(storeCtx, archiveObjectName(rec.Peer, rec.Operation, rec.RequestID, rec.At, encoded), encoded)
+			cancel()
 			if err != nil {
 				archiveErr = err
 			} else {
@@ -312,9 +368,12 @@ func (c *Capturer) emit(ctx context.Context, rec *exchangeRecord, archive bool) 
 	if rec.Error != "" {
 		attrs = append(attrs, slog.String("error", rec.Error))
 	}
-	attrs = append(attrs, slog.Any("request", rec.Request))
+	attrs = append(attrs, slog.Any("request", rec.Request.cut(c.bodyLimit)))
 	if rec.Response != nil {
-		attrs = append(attrs, slog.Any("response", rec.Response))
+		attrs = append(attrs, slog.Any("response", rec.Response.cut(c.bodyLimit)))
+	}
+	if rec.Actor != nil {
+		attrs = append(attrs, slog.Any("actor", rec.Actor))
 	}
 	if rec.ChangeKey != "" {
 		attrs = append(attrs, slog.String("changeKey", rec.ChangeKey))
@@ -331,10 +390,10 @@ func (c *Capturer) emit(ctx context.Context, rec *exchangeRecord, archive bool) 
 
 	level := slog.LevelInfo
 	switch {
-	case rec.Unchanged:
-		level = slog.LevelDebug
 	case rec.Error != "" || rec.Status >= http.StatusInternalServerError:
 		level = slog.LevelWarn
+	case rec.Unchanged:
+		level = slog.LevelDebug
 	}
 	slog.Default().LogAttrs(ctx, level, "exchange", attrs...)
 
@@ -355,7 +414,8 @@ func (c *Capturer) Transport(base http.RoundTripper) http.RoundTripper {
 	return &captureTransport{c: c, base: base}
 }
 
-// Client returns an HTTP client whose calls are traced and captured.
+// Client returns an HTTP client whose calls are traced and captured. A
+// zero timeout is no timeout.
 func (c *Capturer) Client(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
@@ -402,6 +462,7 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
+	rules := t.c.rules
 	rec := &exchangeRecord{
 		Direction: "outbound",
 		Peer:      t.c.resolvePeer(ctx, req),
@@ -410,8 +471,8 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		URL:       redactURL(req.URL),
 		At:        start,
 		Request: exchangeSide{
-			Headers:    redactHeaders(sent.Header),
-			bodyRecord: prepareBody(sent.Header.Get("Content-Type"), reqBody, t.c.bodyLimit),
+			Headers:    rules.redactHeaders(sent.Header),
+			bodyRecord: rules.prepareBody(sent.Header.Get("Content-Type"), reqBody, len(reqBody), captureLimit),
 		},
 	}
 	archive := t.c.shouldArchive(ctx, req)
@@ -419,7 +480,7 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	resp, err := t.base.RoundTrip(sent)
 	rec.DurationMs = t.c.now().Sub(start).Milliseconds()
 	if err != nil {
-		rec.Error = err.Error()
+		rec.Error = ErrorText(err)
 		t.c.emit(ctx, rec, archive)
 		return nil, err
 	}
@@ -430,7 +491,7 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		_ = resp.Body.Close()
 		if readErr != nil {
 			rec.Status = resp.StatusCode
-			rec.Error = "read response body: " + readErr.Error()
+			rec.Error = "read response body: " + ErrorText(readErr)
 			t.c.emit(ctx, rec, archive)
 			return nil, fmt.Errorf("read response body: %w", readErr)
 		}
@@ -440,21 +501,79 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	rec.DurationMs = t.c.now().Sub(start).Milliseconds()
 	rec.Status = resp.StatusCode
 	rec.Response = &exchangeSide{
-		Headers:    redactHeaders(resp.Header),
-		bodyRecord: prepareBody(resp.Header.Get("Content-Type"), respBody, t.c.bodyLimit),
+		Headers: rules.redactHeaders(resp.Header),
+		bodyRecord: bodyRecord{
+			Bytes:       len(respBody),
+			ContentType: mediaTypeOf(resp.Header.Get("Content-Type")),
+		},
 	}
 
+	// A repeated answer is compared before it is prepared: an unchanged
+	// poll costs a hash, not a parse.
 	if key := t.c.resolveChangeKey(ctx, req); key != "" {
 		rec.ChangeKey = key
-		if t.c.changes.unchanged(key, respBody) {
+		if t.c.changes.unchanged(key, t.c.changeDigest(respBody)) {
 			rec.Unchanged = true
 			rec.Request.Body = nil
-			rec.Response.Body = nil
+			t.c.emit(ctx, rec, archive)
+			return resp, nil
 		}
 	}
+	rec.Response.bodyRecord = rules.prepareBody(resp.Header.Get("Content-Type"), respBody, len(respBody), captureLimit)
 
 	t.c.emit(ctx, rec, archive)
 	return resp, nil
+}
+
+// mediaTypeOf is the media type of a Content-Type header, without
+// parameters.
+func mediaTypeOf(contentType string) string {
+	if mt, _, err := mime.ParseMediaType(contentType); err == nil {
+		return mt
+	}
+	return contentType
+}
+
+// changeDigest hashes an answer for the change tracker. With volatile
+// fields named, a JSON answer is hashed without them, so a per-call
+// transaction id does not read as a change.
+func (c *Capturer) changeDigest(body []byte) [sha256.Size]byte {
+	if len(c.volatile) == 0 || !looksLikeJSON(body) {
+		return sha256.Sum256(body)
+	}
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return sha256.Sum256(body)
+	}
+	stable, err := json.Marshal(dropFields(v, c.volatile))
+	if err != nil {
+		return sha256.Sum256(body)
+	}
+	return sha256.Sum256(stable)
+}
+
+// dropFields removes the named fields, at any depth, from parsed JSON.
+func dropFields(v any, names map[string]bool) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			if names[strings.ToLower(k)] {
+				delete(t, k)
+				continue
+			}
+			t[k] = dropFields(child, names)
+		}
+		return t
+	case []any:
+		for i, child := range t {
+			t[i] = dropFields(child, names)
+		}
+		return t
+	default:
+		return v
+	}
 }
 
 // InboundDecision is a service's answer to "keep this request?", given
@@ -473,8 +592,11 @@ type InboundDecision struct {
 // what the request turned out to be: the actor the identity middleware
 // recorded (ActorAPIKeyID, ActorUserID), the method, the route.
 //
-// Mount it inside AccessLogMiddleware and before the router. Streaming
-// responses are recorded by size, never buffered.
+// Mount it on the router, inside AccessLogMiddleware, so the route the
+// request matched is known when decide runs. The request body is read as
+// the handler reads it, never ahead of it; what the record keeps of it is
+// its first 2 MiB. Streaming responses are recorded by size, never
+// buffered.
 func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecision) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -485,19 +607,13 @@ func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecis
 			ctx := withActor(r.Context())
 			start := c.now()
 
-			var reqBody []byte
+			var body *prefixReader
 			if r.Body != nil && r.Body != http.NoBody {
-				b, err := io.ReadAll(r.Body)
-				_ = r.Body.Close()
-				if err != nil {
-					http.Error(w, "request body could not be read", http.StatusBadRequest)
-					return
-				}
-				reqBody = b
-				r.Body = io.NopCloser(bytes.NewReader(b))
+				body = &prefixReader{ReadCloser: r.Body, limit: captureLimit}
+				r.Body = body
 			}
 
-			rec := &captureWriter{ResponseWriter: w, status: http.StatusOK, limit: inboundBufferLimit}
+			rec := &captureWriter{ResponseWriter: w, status: http.StatusOK, limit: captureLimit}
 			next.ServeHTTP(rec, r.WithContext(ctx))
 
 			d := decide(r.WithContext(ctx), rec.status)
@@ -508,9 +624,14 @@ func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecis
 			if operation == "" {
 				operation = r.Method + " " + r.URL.Path
 			}
+			var reqBody []byte
+			reqTotal := 0
+			if body != nil {
+				reqBody, reqTotal = body.captured()
+			}
 			record := &exchangeRecord{
 				Direction:  "inbound",
-				Peer:       c.peer,
+				Peer:       c.resolvePeer(ctx, r),
 				Operation:  operation,
 				Method:     r.Method,
 				URL:        redactURL(r.URL),
@@ -518,12 +639,12 @@ func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecis
 				DurationMs: c.now().Sub(start).Milliseconds(),
 				At:         start,
 				Request: exchangeSide{
-					Headers:    redactHeaders(r.Header),
-					bodyRecord: prepareBody(r.Header.Get("Content-Type"), reqBody, c.bodyLimit),
+					Headers:    c.rules.redactHeaders(r.Header),
+					bodyRecord: c.rules.prepareBody(r.Header.Get("Content-Type"), reqBody, reqTotal, captureLimit),
 				},
 				Response: &exchangeSide{
-					Headers:    redactHeaders(rec.Header()),
-					bodyRecord: rec.record(c.bodyLimit),
+					Headers:    c.rules.redactHeaders(rec.Header()),
+					bodyRecord: rec.record(c.rules),
 				},
 			}
 			c.emit(ctx, record, d.Archive)
@@ -531,9 +652,40 @@ func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecis
 	}
 }
 
-// inboundBufferLimit caps what the inbound capture holds of a response
-// while it is written; past it the body is recorded by size alone.
-const inboundBufferLimit = 8 << 20
+// prefixReader hands a request body to the handler as it reads it and
+// keeps the first limit bytes for the record, so the capture never holds
+// more of a body than that, nor reads ahead of the handler.
+type prefixReader struct {
+	io.ReadCloser
+	limit int
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	total int
+}
+
+func (p *prefixReader) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.mu.Lock()
+		p.total += n
+		if room := p.limit - p.buf.Len(); room > 0 {
+			if n > room {
+				p.buf.Write(b[:room])
+			} else {
+				p.buf.Write(b[:n])
+			}
+		}
+		p.mu.Unlock()
+	}
+	return n, err
+}
+
+// captured returns the prefix kept and the bytes read in all.
+func (p *prefixReader) captured() ([]byte, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.Bytes(), p.total
+}
 
 // captureWriter records the status and body of a response as the handler
 // writes it. A streaming response (text/event-stream) is recorded by size
@@ -544,7 +696,6 @@ type captureWriter struct {
 	status   int
 	wrote    bool
 	streamed bool
-	overflow bool
 	bytes    int
 	buf      bytes.Buffer
 	limit    int
@@ -566,11 +717,13 @@ func (w *captureWriter) Write(p []byte) (int, error) {
 	w.once.Do(w.detectStream)
 	w.wrote = true
 	w.bytes += len(p)
-	if !w.streamed && !w.overflow {
-		if w.buf.Len()+len(p) > w.limit {
-			w.overflow = true
-		} else {
-			w.buf.Write(p)
+	if !w.streamed {
+		if room := w.limit - w.buf.Len(); room > 0 {
+			if len(p) > room {
+				w.buf.Write(p[:room])
+			} else {
+				w.buf.Write(p)
+			}
 		}
 	}
 	return w.ResponseWriter.Write(p)
@@ -587,17 +740,10 @@ func (w *captureWriter) Unwrap() http.ResponseWriter {
 }
 
 // record is the response body as captured.
-func (w *captureWriter) record(limit int) bodyRecord {
+func (w *captureWriter) record(r *rules) bodyRecord {
 	ct := w.ResponseWriter.Header().Get("Content-Type")
-	switch {
-	case w.streamed:
+	if w.streamed {
 		return bodyRecord{Body: "<stream>", Bytes: w.bytes, ContentType: "text/event-stream"}
-	case w.overflow:
-		rec := prepareBody(ct, w.buf.Bytes(), limit)
-		rec.Bytes = w.bytes
-		rec.Truncated = true
-		return rec
-	default:
-		return prepareBody(ct, w.buf.Bytes(), limit)
 	}
+	return r.prepareBody(ct, w.buf.Bytes(), w.bytes, captureLimit)
 }

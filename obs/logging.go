@@ -17,11 +17,12 @@
 // propagation. On GCP spans export to Cloud Trace; locally spans are created
 // (so log correlation works) but not exported.
 //
-// Capture: Transport records every outbound HTTP exchange of the client it
-// wraps; CaptureInbound records the inbound exchanges a service chooses to
-// keep. Both write one "exchange" record with the request and response in
-// full, secrets blanked and files reduced to a size and fingerprint, and
-// optionally a copy into the exchange archive. See exchange.go.
+// Capture: a Capturer's Transport records every outbound HTTP exchange of
+// the client it wraps; its Inbound middleware records the inbound exchanges
+// a service chooses to keep. Both write one "exchange" record with the
+// request and response in full, secrets blanked and files reduced to a size
+// and fingerprint, and optionally a copy into the exchange archive. See
+// exchange.go.
 //
 // Severity convention for absorbed failures (an error the code logs and
 // continues past): a failure whose effect is retried or tolerated (poller

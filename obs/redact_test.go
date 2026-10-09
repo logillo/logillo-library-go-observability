@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -18,7 +19,7 @@ func TestSensitiveNamesAreTheCarriersCredentialFields(t *testing.T) {
 		"customerKey", "client_secret", "clientSecret", "accessToken", "refresh_token", "token",
 		"password", "Password", "passwd", "signature", "privateKey", "accountKey", "licenseKey",
 		"X-Vendor-Api-Key", "apikey", "Some-API-Key", "client_id", "pass", "session", "eid",
-		"accountNumber", "account_number", "Idempotency-Key", "idempotencyKey",
+		"accountNumber", "account_number", "Idempotency-Key", "idempotencyKey", "ApiId",
 	}
 	for _, name := range secret {
 		if !sensitiveName(name) {
@@ -27,7 +28,7 @@ func TestSensitiveNamesAreTheCarriersCredentialFields(t *testing.T) {
 	}
 	plain := []string{
 		"Content-Type", "Accept", "X-Request-ID", "deliveryCity", "customerId", "customerReference",
-		"bookingId", "trackingNumber", "customerId", "userName", "user", "ApiId", "timestamp",
+		"bookingId", "trackingNumber", "customerId", "userName", "user", "timestamp",
 		"shipmentPricingSessionId", "monkey", "turkey", "",
 	}
 	for _, name := range plain {
@@ -188,12 +189,12 @@ func TestJSONEncodedAsAStringIsReadThrough(t *testing.T) {
 
 func TestFilesInTextBodiesAreFingerprinted(t *testing.T) {
 	pod := strings.Repeat("JVBERi0xLjcNCiWio4", 100) + "=="
-	xml := `<response><pack_no>V1</pack_no><pod>` + pod + `</pod><labelZpl>^XA^FDshort^XZ</labelZpl></response>`
+	xml := `<response><pack_no>V1</pack_no><pod>` + pod + `</pod><labelZpl>^XA^FDshort label^FS^XZ</labelZpl></response>`
 	got := prepareBody("text/xml", []byte(xml), 0).Body.(string)
 	if strings.Contains(got, pod[:40]) || !strings.Contains(got, `<pod>{"$file":{"bytes":`+strconv.Itoa(len(pod))) || !strings.Contains(got, "<pack_no>V1</pack_no>") {
 		t.Errorf("xml document: %s", got)
 	}
-	if strings.Contains(got, "^FDshort") {
+	if strings.Contains(got, "^FDshort label") {
 		t.Errorf("a label named as one is a file however short: %s", got)
 	}
 	form := "pack_no=V1&label=" + pod
@@ -239,18 +240,18 @@ func TestArchiveObjectNamesFileByPeerDayAndRequest(t *testing.T) {
 
 func TestChangeTrackerReportsRepeatsAndForgetsTheOldest(t *testing.T) {
 	tr := newChangeTracker(2)
-	if tr.unchanged("a", []byte("1")) {
+	if tr.unchanged("a", sha256.Sum256([]byte("1"))) {
 		t.Error("first answer is a change")
 	}
-	if !tr.unchanged("a", []byte("1")) {
+	if !tr.unchanged("a", sha256.Sum256([]byte("1"))) {
 		t.Error("same answer is unchanged")
 	}
-	if tr.unchanged("a", []byte("2")) {
+	if tr.unchanged("a", sha256.Sum256([]byte("2"))) {
 		t.Error("different answer is a change")
 	}
-	tr.unchanged("b", []byte("1"))
-	tr.unchanged("c", []byte("1")) // evicts a
-	if tr.unchanged("a", []byte("2")) {
+	tr.unchanged("b", sha256.Sum256([]byte("1")))
+	tr.unchanged("c", sha256.Sum256([]byte("1"))) // evicts a
+	if tr.unchanged("a", sha256.Sum256([]byte("2"))) {
 		t.Error("an evicted key starts over")
 	}
 }

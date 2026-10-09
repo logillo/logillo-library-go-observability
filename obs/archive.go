@@ -35,13 +35,18 @@ const ArchiveBucketEnv = "EXCHANGE_ARCHIVE_BUCKET"
 
 // NewArchiveFromEnv returns the archive the environment configures: a
 // Cloud Storage bucket named by EXCHANGE_ARCHIVE_BUCKET, or NopArchive when
-// it is unset.
+// it is unset. On an error the archive is nil: a service stops rather than
+// run without the archive it was told to keep.
 func NewArchiveFromEnv(ctx context.Context) (Archive, error) {
 	bucket := strings.TrimSpace(os.Getenv(ArchiveBucketEnv))
 	if bucket == "" {
 		return NopArchive{}, nil
 	}
-	return NewGCSArchive(ctx, bucket)
+	a, err := NewGCSArchive(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 // NopArchive stores nothing and reports no location.
@@ -53,22 +58,33 @@ func (NopArchive) Store(context.Context, string, []byte) (string, error) { retur
 // writer needs only the right to create objects; reading the archive is a
 // separate grant held by whoever investigates.
 type GCSArchive struct {
+	client *storage.Client
 	bucket *storage.BucketHandle
 	name   string
 }
 
-// NewGCSArchive opens the archive in bucket.
+// NewGCSArchive opens the archive in bucket. A write that fails on the way
+// is retried: an object's name is its content's, so a retry writes the
+// same bytes again.
 func NewGCSArchive(ctx context.Context, bucket string) (*GCSArchive, error) {
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open storage client: %w", err)
 	}
-	return &GCSArchive{bucket: client.Bucket(bucket), name: bucket}, nil
+	handle := client.Bucket(bucket).Retryer(storage.WithPolicy(storage.RetryAlways))
+	return &GCSArchive{client: client, bucket: handle, name: bucket}, nil
+}
+
+// Close releases the storage client.
+func (a *GCSArchive) Close() error {
+	return a.client.Close()
 }
 
 func (a *GCSArchive) Store(ctx context.Context, name string, record []byte) (string, error) {
 	w := a.bucket.Object(name).NewWriter(ctx)
 	w.ContentType = "application/json"
+	// One record is one request: no resumable session, no chunk buffer.
+	w.ChunkSize = 0
 	if _, err := w.Write(record); err != nil {
 		_ = w.Close()
 		return "", fmt.Errorf("write archive object: %w", err)
@@ -90,6 +106,7 @@ func archiveObjectName(peer, operation, requestID string, at time.Time, record [
 	if requestID == "" {
 		requestID = "no-request-id"
 	}
+	requestID = unsafeObjectChars.ReplaceAllString(requestID, "-")
 	peer = unsafeObjectChars.ReplaceAllString(strings.ToLower(peer), "-")
 	operation = unsafeObjectChars.ReplaceAllString(strings.ToLower(operation), "-")
 	if operation == "" || operation == "-" {

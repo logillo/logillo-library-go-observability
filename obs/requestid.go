@@ -65,10 +65,12 @@ func NewRequestID() string {
 	return id.String()
 }
 
+// resolveRequestID keeps a supplied id that parses as a UUID, in the
+// canonical spelling, and mints one otherwise.
 func resolveRequestID(supplied string) string {
 	if supplied != "" {
-		if _, err := uuid.Parse(supplied); err == nil {
-			return supplied
+		if id, err := uuid.Parse(supplied); err == nil {
+			return id.String()
 		}
 	}
 	return NewRequestID()
