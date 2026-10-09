@@ -82,9 +82,14 @@ func BodyLimit(n int) CapturerOption {
 // carried as the `id` of a party is the shape this exists for.
 func SensitiveFields(f func(parent, name string) bool) CapturerOption {
 	return func(c *Capturer) {
-		if f != nil {
-			c.rules = &rules{sensitive: f}
+		if f == nil {
+			return
 		}
+		if previous := c.rules.sensitive; previous != nil {
+			c.rules = &rules{sensitive: func(parent, name string) bool { return previous(parent, name) || f(parent, name) }}
+			return
+		}
+		c.rules = &rules{sensitive: f}
 	}
 }
 
@@ -306,11 +311,12 @@ func (c *Capturer) resolveOperation(ctx context.Context, r *http.Request) string
 	return ""
 }
 
-// archiveTimeout bounds the archive write of one exchange. The write runs
-// on a context of its own: the request's may already be cancelled — a
+// archiveTimeout bounds the archive write of one exchange, retries
+// included; the call that produced the exchange waits for it. The write
+// runs on a context of its own: the request's may already be cancelled — a
 // client that stopped waiting for its booking — and that exchange is the
 // one a dispute turns on.
-const archiveTimeout = 10 * time.Second
+const archiveTimeout = 5 * time.Second
 
 // emit writes the record as a log line and, when asked, as an archive file.
 // The archive is written first so the log line can point at the file, and
@@ -453,8 +459,13 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		reqBody = b
 		sent.Body = io.NopCloser(bytes.NewReader(b))
-		sent.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
 		sent.ContentLength = int64(len(b))
+		// A request the caller made replayable stays so; one the caller
+		// made single-shot — a booking under an Idempotency-Key — is never
+		// sent twice by the transport on its own.
+		if req.GetBody != nil {
+			sent.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+		}
 	}
 	if t.c.forwardRequestID && sent.Header.Get(RequestIDHeader) == "" {
 		if id := RequestID(ctx); id != "" {
@@ -628,6 +639,11 @@ func (c *Capturer) Inbound(decide func(r *http.Request, status int) InboundDecis
 			reqTotal := 0
 			if body != nil {
 				reqBody, reqTotal = body.captured()
+			}
+			// A handler that read part of the body, or none, still faced
+			// the whole of it: the record says how much was sent.
+			if r.ContentLength > int64(reqTotal) {
+				reqTotal = int(r.ContentLength)
 			}
 			record := &exchangeRecord{
 				Direction:  "inbound",

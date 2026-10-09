@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // What a captured exchange may never contain, and what it carries in place
@@ -200,7 +201,7 @@ func (r *rules) redactHeaders(h http.Header) map[string]string {
 		case r.field("", name):
 			out[name] = redacted
 		case urlValuedHeaders[strings.ToLower(name)]:
-			out[name] = redactURLsIn(strings.Join(values, ", "))
+			out[name] = redactQueriesIn(redactURLsIn(strings.Join(values, ", ")))
 		default:
 			out[name] = strings.Join(values, ", ")
 		}
@@ -239,12 +240,23 @@ func redactQuery(raw string) string {
 	return q.Encode()
 }
 
-var urlPattern = regexp.MustCompile(`(?i)https?://[^\s<>"'\\]+`)
+var (
+	urlPattern   = regexp.MustCompile(`(?i)https?://[^\s<>"'\\]+`)
+	queryPattern = regexp.MustCompile(`\?[^\s<>"'\\]+`)
+)
 
 // redactURLsIn blanks the secrets of every URL carried in a text: a signed
 // query, user information.
 func redactURLsIn(s string) string {
 	return urlPattern.ReplaceAllStringFunc(s, redactURLString)
+}
+
+// redactQueriesIn blanks the secrets of every query string in a text, a
+// relative URL's included: `/download?token=…`.
+func redactQueriesIn(s string) string {
+	return queryPattern.ReplaceAllStringFunc(s, func(m string) string {
+		return "?" + redactQuery(m[1:])
+	})
 }
 
 // redactURLString blanks the secret query parameters and the user
@@ -271,7 +283,7 @@ func ErrorText(err error) string {
 		return ""
 	}
 	var ue *url.Error
-	if errors.As(err, &ue) && ue.URL != "" {
+	if errors.As(err, &ue) && ue.URL != "" && ue.Err != nil {
 		return redactURLsIn(ue.Op + " " + ue.URL + ": " + ue.Err.Error())
 	}
 	return redactURLsIn(err.Error())
@@ -317,18 +329,27 @@ func (b bodyRecord) cut(limit int) bodyRecord {
 		return b
 	case string:
 		if len(body) > limit {
-			b.Body = body[:limit] + "…"
+			b.Body = body[:runeBoundary(body, limit)] + "…"
 			b.Truncated = true
 		}
 		return b
 	default:
 		encoded, err := json.Marshal(body)
 		if err == nil && len(encoded) > limit {
-			b.Body = string(encoded[:limit]) + "…"
+			b.Body = string(encoded[:runeBoundary(string(encoded), limit)]) + "…"
 			b.Truncated = true
 		}
 		return b
 	}
+}
+
+// runeBoundary returns the largest index at or before limit that starts a
+// rune, so a cut never splits one.
+func runeBoundary(s string, limit int) int {
+	for limit > 0 && limit < len(s) && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return limit
 }
 
 // prepareBody turns raw body bytes into what is recorded: redacted, files
@@ -345,26 +366,23 @@ func (r *rules) prepareBody(contentType string, raw []byte, total int, limit int
 	if total < len(raw) {
 		total = len(raw)
 	}
-	rec := bodyRecord{Bytes: total, ContentType: mediaType}
+	rec := bodyRecord{Bytes: total, ContentType: mediaType, Truncated: total > len(raw)}
 	if len(raw) == 0 {
 		return rec
 	}
 
 	if isBinaryMediaType(mediaType) || isBinaryContent(raw) || len(raw) > limit {
 		rec.Body = fileValue(raw)
-		rec.Truncated = total > len(raw)
 		return rec
 	}
 
 	raw = bytes.TrimPrefix(raw, []byte("\xEF\xBB\xBF"))
 	if v, ok := r.parseJSON(raw); ok {
 		rec.Body = v
-		rec.Truncated = total > len(raw)
 		return rec
 	}
 
 	rec.Body = r.redactText(string(raw))
-	rec.Truncated = total > len(raw)
 	return rec
 }
 
@@ -420,16 +438,21 @@ func isBinaryMediaType(mediaType string) bool {
 
 // isBinaryContent reports whether a body is a file by its first bytes,
 // whatever the declared media type: a PDF handed over as text/plain is
-// still a PDF.
+// still a PDF. Bytes that are not text — a NUL, a byte outside UTF-8 — are
+// a file; a sniffed type alone is not, since a short text can start like
+// an image's signature.
 func isBinaryContent(raw []byte) bool {
 	if bytes.HasPrefix(raw, []byte("%PDF")) {
 		return true
 	}
-	detected, _, err := mime.ParseMediaType(http.DetectContentType(raw))
-	if err != nil || detected == "application/octet-stream" {
-		return false
+	head := raw
+	if len(head) > 512 {
+		head = head[:512]
 	}
-	return isBinaryMediaType(detected)
+	if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
+		return true
+	}
+	return false
 }
 
 // redactValue walks parsed JSON: secret fields are blanked by name, file
@@ -486,7 +509,7 @@ func looksLikeDocument(s string) bool {
 	if strings.HasPrefix(trimmed, "<") {
 		return true
 	}
-	if isURL(s) || !strings.Contains(s, "=") || strings.ContainsAny(s, " \n") {
+	if isURL(s) || !strings.Contains(s, "=") || strings.ContainsAny(s, " \n") || looksLikeBase64(s) {
 		return false
 	}
 	q, err := url.ParseQuery(s)
@@ -577,68 +600,133 @@ func fileMarker(content string) string {
 
 // Text bodies — form posts, XML, SOAP, anything that is not JSON — are
 // redacted by pattern. An XML element whose name is a secret is blanked
-// whole, children and CDATA included; a leaf element holding a document is
-// written as the document's fingerprint. Then every `name=value` or
-// `"name": value` pair is judged by its name with the same test as a JSON
-// field or a header; a secret's value runs to the end of its line or
-// segment, so `Authorization: Bearer <token>` loses the token, not the
-// word before it.
+// whole, attributes, children and CDATA included; a leaf element holding a
+// document is written as the document's fingerprint. Then every
+// `name=value` or `"name": value` pair is judged by its name with the same
+// test as a JSON field or a header; a secret's value runs to the end of its
+// line or segment, so `Authorization: Bearer <token>` loses the token, not
+// the word before it.
 var (
-	xmlOpenTagPattern = regexp.MustCompile(`<((?:[A-Za-z0-9_.\-]*:)?([A-Za-z0-9_.\-]+))(\s[^>]*)?>`)
-	cdataPattern      = regexp.MustCompile(`(?s)^\s*<!\[CDATA\[(.*)\]\]>\s*$`)
-	textPairPattern   = regexp.MustCompile(`(["']?)([A-Za-z0-9_.\-\[\]]+)(["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^&\s,;<>]+)`)
+	xmlTagPattern   = regexp.MustCompile(`<(/?)((?:[A-Za-z0-9_.\-]*:)?([A-Za-z0-9_.\-]+))((?:\s[^>]*?)?)(/?)>`)
+	cdataPattern    = regexp.MustCompile(`(?s)^\s*<!\[CDATA\[(.*)\]\]>\s*$`)
+	textPairPattern = regexp.MustCompile(`(["']?)([A-Za-z0-9_.\-\[\]]+)(["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^&\s,;<>]+)`)
 )
 
 func (r *rules) redactText(s string) string {
 	return r.redactTextPairs(r.redactXML(redactURLsIn(s)))
 }
 
-// redactXML walks the open tags of an XML text. A secret element's whole
-// content is blanked; a leaf whose content is a file is fingerprinted;
-// any other element is descended into.
+// xmlTag is one tag of an XML text, as the tokenizer found it.
+type xmlTag struct {
+	start, end  int
+	name        string // the local name
+	closing     bool   // </name>
+	selfClosing bool   // <name/>
+	attrs       bool   // the tag carries attributes
+}
+
+// redactXML tokenizes the tags of an XML text once and walks them. A
+// secret element's whole content, to its matching close tag, is blanked
+// along with its attributes; a secret element with no close tag is blanked
+// to the end; a leaf whose content is a file is fingerprinted; any other
+// element is left as it is. One pass over the tags, so a page of unclosed
+// tags costs the same as a document.
 func (r *rules) redactXML(s string) string {
 	if !strings.Contains(s, "<") {
 		return s
 	}
+	tags := tokenizeXML(s)
+	if len(tags) == 0 {
+		return s
+	}
 	var out strings.Builder
-	closeTags := map[string]*regexp.Regexp{}
 	cursor := 0
-	for cursor < len(s) {
-		loc := xmlOpenTagPattern.FindStringSubmatchIndex(s[cursor:])
-		if loc == nil {
-			break
-		}
-		openStart, openEnd := cursor+loc[0], cursor+loc[1]
-		name := s[cursor+loc[4] : cursor+loc[5]]
-		out.WriteString(s[cursor:openEnd])
-		cursor = openEnd
-		if strings.HasSuffix(s[openStart:openEnd], "/>") {
+	for i := 0; i < len(tags); i++ {
+		tag := tags[i]
+		out.WriteString(s[cursor:tag.start])
+		if tag.closing {
+			out.WriteString(s[tag.start:tag.end])
+			cursor = tag.end
 			continue
 		}
-		closeTag, ok := closeTags[name]
-		if !ok {
-			closeTag = regexp.MustCompile(`</(?:[A-Za-z0-9_.\-]*:)?` + regexp.QuoteMeta(name) + `\s*>`)
-			closeTags[name] = closeTag
-		}
-		closeLoc := closeTag.FindStringIndex(s[cursor:])
-		if closeLoc == nil {
+		if !r.field("", tag.name) {
+			if j := i + 1; !tag.selfClosing && j < len(tags) && tags[j].closing && tags[j].name == tag.name {
+				content := stripCDATA(s[tag.end:tags[j].start])
+				if isFileField(tag.name, content) || isFileText(content) {
+					out.WriteString(s[tag.start:tag.end])
+					out.WriteString(fileMarker(content))
+					out.WriteString(s[tags[j].start:tags[j].end])
+					cursor = tags[j].end
+					i = j
+					continue
+				}
+			}
+			out.WriteString(s[tag.start:tag.end])
+			cursor = tag.end
 			continue
 		}
-		inner := s[cursor : cursor+closeLoc[0]]
-		switch {
-		case r.field("", name):
-			out.WriteString(redacted)
-			cursor += closeLoc[0]
-		case !strings.Contains(stripCDATA(inner), "<"):
-			content := stripCDATA(inner)
-			if isFileField(name, content) || isFileText(content) {
-				out.WriteString(fileMarker(content))
-				cursor += closeLoc[0]
+		// A secret element: its attributes go, and its content to the
+		// matching close tag.
+		out.WriteString("<" + qualifiedName(s, tag))
+		if tag.attrs {
+			out.WriteString(" " + redacted)
+		}
+		if tag.selfClosing {
+			out.WriteString("/>")
+			cursor = tag.end
+			continue
+		}
+		out.WriteString(">" + redacted)
+		depth := 1
+		j := i + 1
+		for ; j < len(tags); j++ {
+			if tags[j].name != tag.name || tags[j].selfClosing {
+				continue
+			}
+			if tags[j].closing {
+				depth--
+				if depth == 0 {
+					break
+				}
+			} else {
+				depth++
 			}
 		}
+		if j == len(tags) {
+			return out.String()
+		}
+		out.WriteString(s[tags[j].start:tags[j].end])
+		cursor = tags[j].end
+		i = j
 	}
 	out.WriteString(s[cursor:])
 	return out.String()
+}
+
+// tokenizeXML finds every tag of an XML text, in order.
+func tokenizeXML(s string) []xmlTag {
+	matches := xmlTagPattern.FindAllStringSubmatchIndex(s, -1)
+	tags := make([]xmlTag, 0, len(matches))
+	for _, m := range matches {
+		tags = append(tags, xmlTag{
+			start:       m[0],
+			end:         m[1],
+			name:        s[m[6]:m[7]],
+			closing:     m[3] > m[2],
+			selfClosing: m[11] > m[10],
+			attrs:       m[9] > m[8],
+		})
+	}
+	return tags
+}
+
+// qualifiedName returns the tag's name with its namespace prefix.
+func qualifiedName(s string, tag xmlTag) string {
+	m := xmlTagPattern.FindStringSubmatchIndex(s[tag.start:tag.end])
+	if m == nil {
+		return tag.name
+	}
+	return s[tag.start+m[4] : tag.start+m[5]]
 }
 
 // stripCDATA returns the content of a CDATA section, or s itself.
@@ -671,6 +759,9 @@ func (r *rules) redactTextPairs(s string) string {
 			// URL, and its pairs are judged next.
 			out.WriteString(s[start:valueStart])
 			end = valueStart
+		case strings.HasPrefix(value, redacted), strings.HasPrefix(value, "%3Credacted%3E"):
+			// Blanked already, by the URL rules.
+			out.WriteString(s[start:end])
 		case r.field("", name):
 			out.WriteString(s[start:valueStart])
 			end = valueStart + segmentEnd(s[valueStart:])
@@ -688,15 +779,20 @@ func (r *rules) redactTextPairs(s string) string {
 }
 
 // segmentEnd returns the length of a secret's value in text: a quoted
-// value whole, otherwise up to the end of the line or the next `&`, `;`,
-// or tag.
+// value whole (an escaped quote inside it stepped over), otherwise up to
+// the end of the line or the next `&`, `;`, `,` or tag.
 func segmentEnd(s string) int {
 	if len(s) > 0 && (s[0] == '"' || s[0] == '\'') {
-		if i := strings.IndexByte(s[1:], s[0]); i >= 0 {
-			return i + 2
+		for i := 1; i < len(s); i++ {
+			switch s[i] {
+			case '\\':
+				i++
+			case s[0]:
+				return i + 1
+			}
 		}
 	}
-	if i := strings.IndexAny(s, "&;<>\r\n"); i >= 0 {
+	if i := strings.IndexAny(s, "&;,<>\r\n"); i >= 0 {
 		return i
 	}
 	return len(s)

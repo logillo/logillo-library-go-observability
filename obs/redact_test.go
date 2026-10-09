@@ -195,7 +195,7 @@ func TestFilesInTextBodiesAreFingerprinted(t *testing.T) {
 		t.Errorf("xml document: %s", got)
 	}
 	if strings.Contains(got, "^FDshort label") {
-		t.Errorf("a label named as one is a file however short: %s", got)
+		t.Errorf("a label named as one is a file past a format's length: %s", got)
 	}
 	form := "pack_no=V1&label=" + pod
 	got = prepareBody("application/x-www-form-urlencoded", []byte(form), 0).Body.(string)

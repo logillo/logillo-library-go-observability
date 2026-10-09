@@ -61,7 +61,7 @@ func InitTracing(ctx context.Context, serviceName string) (func(context.Context)
 // urlAttributes are the span attributes that carry a URL or a query: the
 // HTTP instrumentation writes the full URL of a client call, query and
 // all, and a query may carry a signature or a token.
-var urlAttributes = map[attribute.Key]bool{"url.full": true, "http.url": true, "http.target": true}
+var urlAttributes = map[attribute.Key]bool{"url.full": true, "http.url": true}
 
 // redactingExporter hands spans on with the secrets of their URL
 // attributes blanked, so a signed query never reaches the trace store.
@@ -89,6 +89,8 @@ func redactSpan(s sdktrace.ReadOnlySpan) sdktrace.ReadOnlySpan {
 		switch {
 		case urlAttributes[kv.Key]:
 			value = redactURLString(kv.Value.AsString())
+		case kv.Key == "http.target":
+			value = redactQueriesIn(kv.Value.AsString())
 		case kv.Key == "url.query":
 			value = redactQuery(kv.Value.AsString())
 		default:

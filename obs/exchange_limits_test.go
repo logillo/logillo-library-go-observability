@@ -44,15 +44,16 @@ func TestInboundCaptureKeepsAPrefixAndStreamsTheRest(t *testing.T) {
 }
 
 // A handler that never reads the body leaves the capture with nothing to
-// hold, and the record says how much arrived: nothing.
+// hold; the record says how much was sent and that it holds none of it.
 func TestInboundCaptureHoldsNothingTheHandlerDidNotRead(t *testing.T) {
 	sink := installLogSink(t)
 	handler := NewCapturer("api").Inbound(func(*http.Request, int) InboundDecision { return InboundDecision{Log: true} })(
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/things", strings.NewReader(`{"password":"x"}`))
+	body := `{"password":"x"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/things", strings.NewReader(body))
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 	e := sink.entries(t, "exchange")[0]
-	if request := e["request"].(map[string]any); request["bytes"] != float64(0) || request["body"] != nil {
+	if request := e["request"].(map[string]any); request["bytes"] != float64(len(body)) || request["body"] != nil || request["truncated"] != true {
 		t.Errorf("request record = %v", request)
 	}
 }
